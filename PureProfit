@@ -1,0 +1,293 @@
+import MetaTrader5 as mt5
+import pandas as pd
+import time
+from datetime import datetime
+import logging
+import sys
+import numpy as np
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('forex_bot.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+class ForexTradingBot:
+    def __init__(self, symbol, timeframe, sma_short_period=50, sma_long_period=200, lot_size=0.1, 
+                 stop_loss_pips=50, take_profit_pips=100, deviation=20):
+        """
+        Initialize the trading bot with strategy parameters.
+        
+        Args:
+            symbol (str): Trading symbol (e.g., 'EURUSD')
+            timeframe: MT5 timeframe (e.g., mt5.TIMEFRAME_M15)
+            sma_short_period (int): Short SMA period
+            sma_long_period (int): Long SMA period
+            lot_size (float): Trade volume
+            stop_loss_pips (int): Stop loss in pips
+            take_profit_pips (int): Take profit in pips
+            deviation (int): Maximum price deviation for orders
+        """
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.sma_short_period = sma_short_period
+        self.sma_long_period = sma_long_period
+        self.lot_size = lot_size
+        self.stop_loss_pips = stop_loss_pips
+        self.take_profit_pips = take_profit_pips
+        self.deviation = deviation
+        self.trade_log_file = 'trade_log.csv'
+        self.initialize_mt5()
+        
+    def initialize_mt5(self):
+        """Initialize connection to MT5 terminal."""
+        if not mt5.initialize():
+            logging.error("Initialize() failed, error code =", mt5.last_error())
+            quit()
+        
+        # Enable display of everything in the Python console
+        mt5.terminal_info()
+        mt5.version()
+        
+        logging.info(f"Connected to MT5 Terminal {mt5.version()}")
+    
+    def shutdown(self):
+        """Shutdown MT5 connection."""
+        mt5.shutdown()
+        logging.info("MT5 connection shutdown")
+    
+    def get_historical_data(self, num_bars=300):
+        """
+        Retrieve historical data for the symbol.
+        
+        Args:
+            num_bars (int): Number of bars to retrieve
+            
+        Returns:
+            pd.DataFrame: DataFrame with OHLC data
+        """
+        bars = mt5.copy_rates_from_pos(self.symbol, self.timeframe, 0, num_bars)
+        if bars is None:
+            logging.error(f"Failed to get historical data for {self.symbol}")
+            return None
+        
+        df = pd.DataFrame(bars)
+        df['time'] = pd.to_datetime(df['time'], unit='s')
+        df.set_index('time', inplace=True)
+        
+        return df
+    
+    def calculate_sma(self, df):
+        """
+        Calculate SMAs for the given DataFrame.
+        
+        Args:
+            df (pd.DataFrame): DataFrame with price data
+            
+        Returns:
+            pd.DataFrame: DataFrame with SMA columns added
+        """
+        df['sma_short'] = df['close'].rolling(window=self.sma_short_period).mean()
+        df['sma_long'] = df['close'].rolling(window=self.sma_long_period).mean()
+        return df
+    
+    def check_crossover(self, df):
+        """
+        Check for SMA crossover signals.
+        
+        Args:
+            df (pd.DataFrame): DataFrame with SMA values
+            
+        Returns:
+            str: 'buy' for bullish crossover, 'sell' for bearish crossover, None if no signal
+        """
+        if len(df) < 2:
+            return None
+        
+        # Get the last two data points
+        prev_row = df.iloc[-2]
+        current_row = df.iloc[-1]
+        
+        # Bullish crossover (short SMA crosses above long SMA)
+        if (prev_row['sma_short'] <= prev_row['sma_long'] and 
+            current_row['sma_short'] > current_row['sma_long']):
+            return 'buy'
+        
+        # Bearish crossover (short SMA crosses below long SMA)
+        elif (prev_row['sma_short'] >= prev_row['sma_long'] and 
+              current_row['sma_short'] < current_row['sma_long']):
+            return 'sell'
+        
+        return None
+    
+    def get_current_price(self):
+        """Get the current bid/ask price."""
+        tick = mt5.symbol_info_tick(self.symbol)
+        return tick.bid, tick.ask
+    
+    def calculate_position_size(self):
+        """
+        Calculate position size based on account balance and risk parameters.
+        In a real implementation, this would be more sophisticated.
+        """
+        return self.lot_size
+    
+    def send_order(self, signal):
+        """
+        Send a market order based on the signal.
+        
+        Args:
+            signal (str): 'buy' or 'sell'
+            
+        Returns:
+            bool: True if order was successful, False otherwise
+        """
+        symbol_info = mt5.symbol_info(self.symbol)
+        if symbol_info is None:
+            logging.error(f"{self.symbol} not found")
+            return False
+        
+        if not symbol_info.visible:
+            logging.error(f"{self.symbol} is not visible, trying to switch on")
+            if not mt5.symbol_select(self.symbol, True):
+                logging.error(f"Failed to select {self.symbol}")
+                return False
+        
+        point = mt5.symbol_info(self.symbol).point
+        bid, ask = self.get_current_price()
+        
+        if signal == 'buy':
+            order_type = mt5.ORDER_BUY
+            price = ask
+            sl = price - self.stop_loss_pips * point
+            tp = price + self.take_profit_pips * point
+        elif signal == 'sell':
+            order_type = mt5.ORDER_SELL
+            price = bid
+            sl = price + self.stop_loss_pips * point
+            tp = price - self.take_profit_pips * point
+        else:
+            return False
+        
+        lot_size = self.calculate_position_size()
+        
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": self.symbol,
+            "volume": lot_size,
+            "type": order_type,
+            "price": price,
+            "sl": sl,
+            "tp": tp,
+            "deviation": self.deviation,
+            "magic": 123456,
+            "comment": "SMA Crossover Bot",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        
+        result = mt5.order_send(request)
+        
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            logging.error(f"Order failed, retcode={result.retcode}")
+            return False
+        
+        logging.info(f"Order succeeded, ticket={result.order}")
+        self.log_trade(signal, price, sl, tp, lot_size, result.order)
+        return True
+    
+    def log_trade(self, signal, price, sl, tp, volume, ticket):
+        """
+        Log trade details to CSV file.
+        
+        Args:
+            signal (str): Trade direction
+            price (float): Entry price
+            sl (float): Stop loss price
+            tp (float): Take profit price
+            volume (float): Trade volume
+            ticket (int): Order ticket number
+        """
+        trade_data = {
+            'timestamp': datetime.now(),
+            'symbol': self.symbol,
+            'signal': signal,
+            'price': price,
+            'stop_loss': sl,
+            'take_profit': tp,
+            'volume': volume,
+            'ticket': ticket
+        }
+        
+        try:
+            # Try to read existing log file
+            log_df = pd.read_csv(self.trade_log_file)
+        except (FileNotFoundError, pd.errors.EmptyDataError):
+            # Create new DataFrame if file doesn't exist
+            log_df = pd.DataFrame(columns=trade_data.keys())
+        
+        # Append new trade data
+        log_df = log_df.append(trade_data, ignore_index=True)
+        log_df.to_csv(self.trade_log_file, index=False)
+        
+        logging.info(f"Trade logged: {trade_data}")
+    
+    def check_open_positions(self):
+        """Check if there are any open positions for our symbol."""
+        positions = mt5.positions_get(symbol=self.symbol)
+        if positions is None:
+            return 0
+        return len(positions)
+    
+    def run(self):
+        """Main trading loop."""
+        logging.info("Starting trading bot...")
+        
+        try:
+            while True:
+                # Get historical data
+                df = self.get_historical_data()
+                if df is None:
+                    time.sleep(60)
+                    continue
+                
+                # Calculate indicators
+                df = self.calculate_sma(df)
+                
+                # Check for signals
+                signal = self.check_crossover(df)
+                
+                if signal and self.check_open_positions() == 0:
+                    logging.info(f"Signal detected: {signal}")
+                    self.send_order(signal)
+                else:
+                    logging.debug("No trading signal detected or position already open")
+                
+                # Wait before next check
+                time.sleep(60)
+                
+        except KeyboardInterrupt:
+            logging.info("Shutting down bot...")
+        finally:
+            self.shutdown()
+
+if __name__ == "__main__":
+    # Configuration parameters
+    config = {
+        'symbol': 'EURUSD',
+        'timeframe': mt5.TIMEFRAME_H1,  # 1-hour timeframe
+        'sma_short_period': 50,
+        'sma_long_period': 200,
+        'lot_size': 0.1,  # Standard lot size
+        'stop_loss_pips': 50,  # 50 pips stop loss
+        'take_profit_pips': 100,  # 100 pips take profit
+        'deviation': 20  # Maximum price deviation
+    }
+    
+    # Create and run bot
+    bot = ForexTradingBot(**config)
+    bot.run()
